@@ -196,26 +196,3 @@ for u in "${SYS_USERS[@]}"; do
     printf "%-20s %-15s %-25s %s\n" "$u" "$in_readme" "$is_admin_now" "$readme_says_admin"
 done
 
-echo ""
-echo "=================================================================="
-echo " Flags to check manually"
-echo "=================================================================="
-for u in "${SYS_USERS[@]}"; do
-    u_lower=$(echo "$u" | tr '[:upper:]' '[:lower:]')
-    if ! echo "$readme_lower" | grep -qw "$u_lower"; then
-        echo "  [!] '$u' exists on the system (UID >= $UID_MIN) but its name doesn't appear anywhere in the README."
-        echo "      Could be unauthorized, or a service account the README describes differently -- verify manually."
-    fi
-
-    admin_groups_matched=$(check_admin_status "$u")
-    if [[ -n "$admin_groups_matched" ]]; then
-        if ! (grep -i "$u" "$README" 2>/dev/null | grep -qi "admin"); then
-            echo "  [!] '$u' currently HAS admin rights (via: $admin_groups_matched) but the README doesn't clearly say they should."
-        fi
-    fi
-done
-
-echo ""
-echo "Done. Remember: the README section above and the auto cross-reference"
-echo "are only a starting point -- always confirm manually against the"
-echo "README's actual wording, especially for service accounts."
