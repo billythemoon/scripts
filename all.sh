@@ -1,0 +1,17 @@
+./random.sh
+./password.sh
+./lockout.sh
+./ssh.sh
+echo
+echo
+echo
+echo
+echo
+echo
+echo
+echo
+echo
+echo
+echo
+./cron.sh
+./users.sh
