@@ -1,15 +1,36 @@
 #!/usr/bin/env bash
 # =============================================================================
-# squid_audit.sh - Read-only security audit of a Squid proxy server
+# squid_harden.sh - Apply hardening fixes to a Squid proxy (Debian/Ubuntu/RHEL)
 #
-# Checks Squid's configuration and runtime state against a hardening checklist
-# and reports PASS / WARN / FAIL for each item. Nothing is changed.
+# Pairs with squid_audit.sh. Applies the config, permission, systemd and
+# (optionally) firewall fixes, validates with "squid -k parse" before touching
+# the live config, and rolls back automatically if Squid fails to restart.
 #
-# Usage:   sudo ./squid_audit.sh [-c /path/to/squid.conf]
-# Exit:    0 = no failures, 1 = one or more FAIL results, 2 = setup error
+# Usage:
+#   sudo ./squid_harden.sh [-i BIND_IP] [-s TRUSTED_SUBNET] [-n] [-u] [-R]
+#
+#   -i IP      Bind Squid to this internal IP (e.g. 10.0.0.1). Skipped if omitted.
+#   -s CIDR    Firewall: allow the proxy port only from this subnet (e.g. 10.0.0.0/24).
+#              Skipped if omitted. Repeatable (-s A -s B).
+#   -n         Dry run: show the config diff and planned actions, change nothing.
+#   -u         Also upgrade the squid package from the distro repositories.
+#   -R         Don't restart Squid (you'll need to restart it yourself).
+#   -c FILE    Path to squid.conf (auto-detected if omitted).
+#   -h         Help.
+#
+# Examples:
+#   sudo ./squid_harden.sh -n -i 10.0.0.1 -s 10.0.0.0/24     # preview
+#   sudo ./squid_harden.sh -i 10.0.0.1 -s 10.0.0.0/24        # apply
 # =============================================================================
 
 set -uo pipefail
+
+# ---------- tunables ----------------------------------------------------------
+MAXCONN=50
+REPLY_BODY_MAX="500 MB"
+REQUEST_BODY_MAX="50 MB"
+CLIENT_LIFETIME="1 hour"
+VISIBLE_HOSTNAME="proxy"
 
 # ---------- output helpers ----------------------------------------------------
 if [[ -t 1 ]]; then
@@ -17,431 +38,298 @@ if [[ -t 1 ]]; then
 else
   RED=""; GRN=""; YEL=""; BLU=""; BLD=""; RST=""
 fi
-
-PASS_N=0; WARN_N=0; FAIL_N=0
-
-pass()    { printf '  %s[PASS]%s %s\n' "$GRN" "$RST" "$1"; PASS_N=$((PASS_N+1)); }
-warn()    { printf '  %s[WARN]%s %s\n' "$YEL" "$RST" "$1"; [[ -n ${2:-} ]] && printf '         fix: %s\n' "$2"; WARN_N=$((WARN_N+1)); }
-fail()    { printf '  %s[FAIL]%s %s\n' "$RED" "$RST" "$1"; [[ -n ${2:-} ]] && printf '         fix: %s\n' "$2"; FAIL_N=$((FAIL_N+1)); }
-info()    { printf '  %s[INFO]%s %s\n' "$BLU" "$RST" "$1"; }
+ok()      { printf '  %s[ OK ]%s %s\n' "$GRN" "$RST" "$1"; }
+skip()    { printf '  %s[SKIP]%s %s\n' "$BLU" "$RST" "$1"; }
+note()    { printf '  %s[NOTE]%s %s\n' "$YEL" "$RST" "$1"; }
+err()     { printf '  %s[FAIL]%s %s\n' "$RED" "$RST" "$1"; }
+plan()    { printf '  %s[PLAN]%s %s\n' "$BLU" "$RST" "$1"; }
 section() { printf '\n%s== %s ==%s\n' "$BLD" "$1" "$RST"; }
+die()     { printf '%sError:%s %s\n' "$RED" "$RST" "$1" >&2; exit 2; }
 
-usage() {
-  cat <<EOF
-Usage: $0 [-c /path/to/squid.conf]
-
-Audits a Squid proxy against a hardening checklist (read-only).
-Run as root for complete results (file permissions, process and socket checks).
-
-  -c FILE   Path to squid.conf (auto-detected if omitted)
-  -h        Show this help
-EOF
-}
+usage() { sed -n '2,/^# =====/p' "$0" | sed '1d;$d;s/^# \{0,1\}//'; }
 
 # ---------- arguments ---------------------------------------------------------
-CONF_FILE=""
-while getopts ":c:h" opt; do
+BIND_IP=""; SUBNETS=(); DRY_RUN=0; UPGRADE=0; NO_RESTART=0; CONF=""
+while getopts ":i:s:c:nuRh" opt; do
   case $opt in
-    c) CONF_FILE=$OPTARG ;;
+    i) BIND_IP=$OPTARG ;;
+    s) SUBNETS+=("$OPTARG") ;;
+    c) CONF=$OPTARG ;;
+    n) DRY_RUN=1 ;;
+    u) UPGRADE=1 ;;
+    R) NO_RESTART=1 ;;
     h) usage; exit 0 ;;
+    :) die "-$OPTARG needs a value" ;;
     *) usage; exit 2 ;;
   esac
 done
 
-if [[ -z $CONF_FILE ]]; then
-  for f in /etc/squid/squid.conf /etc/squid3/squid.conf \
-           /usr/local/squid/etc/squid.conf /usr/local/etc/squid/squid.conf; do
-    [[ -f $f ]] && { CONF_FILE=$f; break; }
+[[ $EUID -eq 0 ]] || die "run as root (sudo)."
+
+if [[ -z $CONF ]]; then
+  for f in /etc/squid/squid.conf /etc/squid3/squid.conf /usr/local/squid/etc/squid.conf; do
+    [[ -f $f ]] && { CONF=$f; break; }
   done
 fi
+[[ -n $CONF && -f $CONF ]] || die "squid.conf not found. Use -c /path/to/squid.conf"
+CONF_DIR=$(dirname "$CONF")
 
-if [[ -z $CONF_FILE || ! -r $CONF_FILE ]]; then
-  echo "${RED}Error:${RST} squid.conf not found or not readable. Use -c /path/to/squid.conf" >&2
-  exit 2
+SQUID_BIN=$(command -v squid || command -v squid3 || true)
+[[ -n $SQUID_BIN ]] || die "squid binary not found."
+
+if [[ -n $BIND_IP ]]; then
+  [[ $BIND_IP =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]] || die "-i must be an IPv4 address."
+  if command -v ip >/dev/null 2>&1; then
+    ip -o addr show | grep -qw "inet $BIND_IP" || die "$BIND_IP is not assigned to any interface on this host."
+  elif command -v hostname >/dev/null 2>&1; then
+    hostname -I 2>/dev/null | tr ' ' '\n' | grep -qx "$BIND_IP" || die "$BIND_IP is not assigned to any interface on this host."
+  fi
 fi
-
-SQUID_BIN=""
-for b in squid squid3 /usr/sbin/squid /usr/local/squid/sbin/squid; do
-  if command -v "$b" >/dev/null 2>&1; then SQUID_BIN=$(command -v "$b"); break; fi
+for s in "${SUBNETS[@]}"; do
+  [[ $s =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}/[0-9]{1,2}$ ]] || die "-s must be CIDR like 10.0.0.0/24 (got '$s')."
 done
 
-[[ $EUID -ne 0 ]] && echo "${YEL}Note:${RST} not running as root; some checks may be incomplete."
+SQUID_USER=$(awk '$1=="cache_effective_user"{print $2}' "$CONF" | tail -n1)
+if [[ -z $SQUID_USER ]]; then
+  for u in proxy squid; do id "$u" >/dev/null 2>&1 && { SQUID_USER=$u; break; }; done
+fi
+SQUID_GROUP=$(id -gn "${SQUID_USER:-root}" 2>/dev/null || echo root)
 
-# ---------- config loading (follows include directives) -----------------------
-WORK=$(mktemp -d)
-trap 'rm -rf "$WORK"' EXIT
-CONF_FILES=()
+HAS_SYSTEMD=0
+command -v systemctl >/dev/null 2>&1 && systemctl cat squid.service >/dev/null 2>&1 && HAS_SYSTEMD=1
 
-collect_conf() {
-  local f=$1 depth=${2:-0} line inc
-  (( depth > 10 )) && return
-  [[ -r $f ]] || return
-  CONF_FILES+=("$f")
-  while IFS= read -r line || [[ -n $line ]]; do
-    line=${line%%#*}
-    line=${line#"${line%%[![:space:]]*}"}
-    line=${line%"${line##*[![:space:]]}"}
-    [[ -z $line ]] && continue
-    if [[ $line =~ ^include[[:space:]]+(.+)$ ]]; then
-      for inc in ${BASH_REMATCH[1]}; do collect_conf "$inc" $((depth+1)); done
-    else
-      printf '%s\n' "$line"
-    fi
-  done < "$f"
-}
+STAMP=$(date +%Y%m%d-%H%M%S)
+BACKUP="/root/squid-harden-backup-$STAMP"
+WORK=$(mktemp -d); trap 'rm -rf "$WORK"' EXIT
+STAGED="$WORK/squid.conf"
+cp -a "$CONF" "$STAGED"
 
-collect_conf "$CONF_FILE" > "$WORK/raw"
-CONF=$(awk '{$1=$1; print}' "$WORK/raw")          # normalise whitespace
-HTTP_ACCESS=$(grep -E '^http_access ' <<<"$CONF" || true)
-
-values()     { awk -v d="$1" '$1==d { $1=""; sub(/^ +/, ""); print }' <<<"$CONF"; }
-last_value() { values "$1" | tail -n1; }
-
-# Position of the first "allow" rule for network clients (ignores rules that
-# only match the proxy host itself, like 'allow localhost [manager]').
-FIRST_ALLOW=$(grep -nE '^http_access allow' <<<"$HTTP_ACCESS" | grep -vE 'allow localhost( manager)?$' | head -n1 | cut -d: -f1)
-
-# A deny rule must exist AND come before the first allow rule to be effective.
-check_deny_rule() {
-  local desc=$1 regex=$2 fix=$3 idx
-  idx=$(grep -nE "$regex" <<<"$HTTP_ACCESS" | head -n1 | cut -d: -f1)
-  if [[ -z $idx ]]; then
-    fail "$desc: rule missing" "$fix"
-  elif [[ -n $FIRST_ALLOW && $idx -gt $FIRST_ALLOW ]]; then
-    warn "$desc: rule exists but comes after an allow rule, so clients matched by that rule bypass it" \
-         "Move it above the first 'http_access allow' line"
-  else
-    pass "$desc"
-  fi
-}
-
-perm_other() { stat -c '%a' "$1" 2>/dev/null | awk '{print substr($0, length($0), 1)}'; }
-perm_group() { stat -c '%a' "$1" 2>/dev/null | awk '{print substr($0, length($0)-1, 1)}'; }
-
-printf '%sSquid hardening audit%s  (%s)\n' "$BLD" "$RST" "$(date '+%Y-%m-%d %H:%M')"
-printf 'Config: %s' "$CONF_FILE"
-(( ${#CONF_FILES[@]} > 1 )) && printf '  (+%d included file(s))' $(( ${#CONF_FILES[@]} - 1 ))
-printf '\n'
+printf '%sSquid hardening%s  %s\n' "$BLD" "$RST" "$( ((DRY_RUN)) && echo '(DRY RUN: nothing will be changed)')"
+printf 'Config: %s   Squid: %s   Run-as user: %s\n' "$CONF" \
+  "$("$SQUID_BIN" -v | head -n1 | grep -oE '[0-9]+\.[0-9]+(\.[0-9]+)?')" "${SQUID_USER:-unknown}"
 
 # =============================================================================
-section "Version and configuration validity"
+section "Package version"
 # =============================================================================
-if [[ -z $SQUID_BIN ]]; then
-  warn "Squid binary not found in PATH; version and parse checks skipped"
-else
-  ver_line=$("$SQUID_BIN" -v 2>/dev/null | head -n1)
-  ver=$(grep -oE '[0-9]+\.[0-9]+(\.[0-9]+)?' <<<"$ver_line" | head -n1)
-  major=${ver%%.*}
-  if [[ -z $ver ]]; then
-    warn "Could not determine Squid version"
-  elif (( major < 6 )); then
-    fail "Squid $ver is end-of-life and has unpatched vulnerabilities" "Upgrade to a supported release (6.x or newer)"
-  else
-    pass "Squid version $ver"
-  fi
-  info "Compare your version against https://github.com/squid-cache/squid/security/advisories"
-
-  if command -v apt >/dev/null 2>&1; then
-    apt list --upgradable 2>/dev/null | grep -q '^squid' && warn "A newer squid package is available" "apt upgrade squid"
+ver=$("$SQUID_BIN" -v | head -n1 | grep -oE '[0-9]+\.[0-9]+' | head -n1)
+if (( UPGRADE )); then
+  if (( DRY_RUN )); then plan "Upgrade squid package from distro repositories"
+  elif command -v apt-get >/dev/null 2>&1; then
+    apt-get update -qq && apt-get install -y -qq --only-upgrade squid && ok "squid package upgraded (if an update was available)"
   elif command -v dnf >/dev/null 2>&1; then
-    dnf -q check-update squid >/dev/null 2>&1; [[ $? -eq 100 ]] && warn "A newer squid package is available" "dnf upgrade squid"
-  fi
-
-  parse_out=$("$SQUID_BIN" -k parse -f "$CONF_FILE" 2>&1)
-  if [[ $? -eq 0 ]]; then
-    nwarn=$(grep -c 'WARNING' <<<"$parse_out")
-    if (( nwarn > 0 )); then
-      warn "Config parses, but with $nwarn warning(s)" "Review: $SQUID_BIN -k parse"
-    else
-      pass "Config parses cleanly (squid -k parse)"
-    fi
+    dnf -y -q upgrade squid && ok "squid package upgraded (if an update was available)"
   else
-    fail "Config has errors (squid -k parse failed)"
-    grep -E 'ERROR|FATAL' <<<"$parse_out" | head -n5 | sed 's/^/         /'
+    note "No apt/dnf found; upgrade squid manually"
   fi
-fi
-
-# =============================================================================
-section "Access control"
-# =============================================================================
-if [[ -z $HTTP_ACCESS ]]; then
-  fail "No http_access rules found" "Define explicit allow rules for your networks, ending with 'http_access deny all'"
 else
-  if [[ $(tail -n1 <<<"$HTTP_ACCESS") == "http_access deny all" ]]; then
-    pass "Final http_access rule is 'deny all'"
-  else
-    fail "Final http_access rule is not 'deny all'" "Add 'http_access deny all' as the last http_access line"
-  fi
-
-  if grep -qx 'http_access allow all' <<<"$HTTP_ACCESS"; then
-    fail "'http_access allow all' present: this is an open proxy" "Replace with 'http_access allow localnet' (or your own ACL)"
-  else
-    pass "No 'http_access allow all' (not an open proxy)"
-  fi
-
-  check_deny_rule "Unsafe ports denied" '^http_access deny (.* )?!Safe_ports( |$)' \
-    "Add 'http_access deny !Safe_ports'"
-  check_deny_rule "CONNECT limited to SSL ports" '^http_access deny (.* )?CONNECT (.* )?!SSL_ports( |$)' \
-    "Add 'http_access deny CONNECT !SSL_ports'"
-  check_deny_rule "Requests to the proxy host itself denied" '^http_access deny (.* )?to_localhost( |$)' \
-    "Add 'http_access deny to_localhost'"
-
-  meta_names=$(awk '$1=="acl" && /169\.254\./ {print $2}' <<<"$CONF" | sort -u | paste -sd'|')
-  meta_regex="to_linklocal${meta_names:+|$meta_names}"
-  check_deny_rule "Cloud metadata / link-local (169.254.0.0/16) denied" \
-    "^http_access deny (.* )?($meta_regex)( |$)" \
-    "Add 'http_access deny to_linklocal' (Squid 6+) or an ACL for 169.254.0.0/16"
-
-  bad_mgr=$(grep -E '^http_access allow (.* )?manager( |$)' <<<"$HTTP_ACCESS" | grep -Ev '(^| )localhost( |$)' || true)
-  if [[ -n $bad_mgr ]]; then
-    fail "Cache manager allowed from non-localhost sources: $bad_mgr" "Use 'http_access allow localhost manager' then 'http_access deny manager'"
-  elif grep -Eq '^http_access deny (.* )?manager( |$)' <<<"$HTTP_ACCESS"; then
-    pass "Cache manager restricted to localhost"
-  else
-    warn "No explicit 'http_access deny manager' rule" "Add 'http_access allow localhost manager' and 'http_access deny manager'"
-  fi
+  skip "Package upgrade (use -u to enable)"
 fi
+(( ${ver%%.*} < 6 )) && note "Squid $ver is EOL upstream. Distro security backports help, but plan a move to 6.x+ (OS upgrade or backports)."
 
 # =============================================================================
-section "Authentication"
+section "Squid configuration"
 # =============================================================================
-auth_schemes=$(values auth_param | awk '{print $1}' | sort -u | paste -sd',')
-auth_acls=$(awk '$1=="acl" && ($3=="proxy_auth" || $3=="proxy_auth_regex" || $3=="ext_user") {print $2}' <<<"$CONF")
-if [[ -z $auth_schemes ]]; then
-  warn "No proxy authentication configured; any host allowed by ACLs can use the proxy" \
-       "Consider auth_param (negotiate/Kerberos or digest preferred) if users should be identified"
-elif [[ -z $auth_acls ]]; then
-  warn "auth_param ($auth_schemes) defined but no proxy_auth ACL enforces it" "Add 'acl authed proxy_auth REQUIRED' and use it in http_access"
+# 1. Remove any previous block from this script (makes re-runs idempotent).
+sed -i '/^# BEGIN squid_harden/,/^# END squid_harden/d' "$STAGED"
+
+# 2. Comment out existing settings this script manages, so they can't override ours.
+MANAGED='httpd_suppress_version_string|via|forwarded_for|visible_hostname|reply_body_max_size|request_body_max_size|client_lifetime'
+sed -i -E "s/^([[:space:]]*)($MANAGED)([[:space:]])/# [squid_harden $STAMP] \1\2\3/" "$STAGED"
+
+# 3. Build the hardening block.
+MAXCONN_RULE="http_access deny harden_maxconn"
+grep -qE '^[[:space:]]*acl[[:space:]]+localnet[[:space:]]' "$STAGED" && MAXCONN_RULE+=" localnet"
+
+cat > "$WORK/block" <<EOF
+# BEGIN squid_harden (managed by squid_harden.sh - edit tunables in the script)
+# Block proxying to the proxy host itself and to cloud metadata / link-local
+acl harden_linklocal dst 169.254.0.0/16 fe80::/10
+http_access deny to_localhost
+http_access deny harden_linklocal
+
+# Per-client connection limit
+acl harden_maxconn maxconn $MAXCONN
+$MAXCONN_RULE
+
+# Hide proxy identity and client addresses
+httpd_suppress_version_string on
+via off
+forwarded_for delete
+visible_hostname $VISIBLE_HOSTNAME
+
+# Resource limits
+reply_body_max_size $REPLY_BODY_MAX
+request_body_max_size $REQUEST_BODY_MAX
+client_lifetime $CLIENT_LIFETIME
+# END squid_harden
+EOF
+
+# 4. Insert it before the first "http_access allow" (so the denies take effect),
+#    else before the final "deny all", else at the end of the file.
+anchor=$(grep -nE '^[[:space:]]*http_access[[:space:]]+allow' "$STAGED" | head -n1 | cut -d: -f1)
+[[ -z $anchor ]] && anchor=$(grep -nE '^[[:space:]]*http_access[[:space:]]+deny[[:space:]]+all' "$STAGED" | tail -n1 | cut -d: -f1)
+if [[ -n $anchor ]]; then
+  awk -v n="$anchor" -v blk="$WORK/block" 'NR==n { while ((getline l < blk) > 0) print l; print "" } { print }' \
+    "$STAGED" > "$WORK/tmp" && mv "$WORK/tmp" "$STAGED"
 else
-  pass "Proxy authentication enforced (schemes: $auth_schemes)"
-  [[ $auth_schemes == basic ]] && info "Basic auth sends passwords in cleartext to the proxy; prefer negotiate or digest, or an https_port"
+  { echo; cat "$WORK/block"; } >> "$STAGED"
 fi
 
-# =============================================================================
-section "Network exposure"
-# =============================================================================
-PORTS=()
-port_lines=$( { values http_port; values https_port; } )
-if [[ -z $port_lines ]]; then
-  warn "No http_port set; Squid defaults to 3128 on ALL interfaces" "Set e.g. 'http_port 10.0.0.1:3128'"
-  PORTS+=(3128)
-else
-  while read -r line; do
-    addr=${line%% *}
-    PORTS+=("${addr##*:}")
-    if [[ $addr =~ ^[0-9]+$ || $addr == 0.0.0.0:* || $addr == "[::]:"* ]]; then
-      warn "Listener '$addr' binds to all interfaces" "Bind to an internal IP, e.g. 'http_port 10.0.0.1:${addr##*:}'"
-    else
-      pass "Listener bound to specific address: $addr"
-    fi
-  done <<<"$port_lines"
+# 5. Bind listeners to the internal IP.
+if [[ -n $BIND_IP ]]; then
+  sed -i -E "s/^([[:space:]]*http_port[[:space:]]+)(0\.0\.0\.0:)?([0-9]+)([[:space:]]|$)/\1$BIND_IP:\3\4/" "$STAGED"
+  grep -qE '^[[:space:]]*http_port' "$STAGED" || echo "http_port $BIND_IP:3128" >> "$STAGED"
 fi
 
-if command -v ss >/dev/null 2>&1; then
-  live=$(ss -Hltnp 2>/dev/null | awk '/"squid"/ {print $4}' | sort -u)
-  if [[ -z $live ]]; then
-    info "No live squid listening sockets found (not running, or need root to see process names)"
-  else
-    wide=$(grep -E '^(0\.0\.0\.0|\*|\[::\]):' <<<"$live" | paste -sd' ' || true)
-    if [[ -n $wide ]]; then
-      warn "Squid is currently listening on all interfaces: $wide"
-    else
-      pass "Live sockets bound to specific addresses: $(paste -sd' ' <<<"$live")"
-    fi
-  fi
-fi
-
-check_port_off() {
-  local d=$1 v
-  v=$(last_value "$d")
-  if [[ -z $v || $v == 0 ]]; then pass "$d disabled"
-  else fail "$d is enabled ($v)" "Set '$d 0' unless you use it"; fi
-}
-check_port_off icp_port
-check_port_off htcp_port
-check_port_off snmp_port
-
-fw_rules=$( { iptables-save 2>/dev/null; ip6tables-save 2>/dev/null; nft list ruleset 2>/dev/null;
-              ufw status 2>/dev/null; firewall-cmd --list-all 2>/dev/null; } || true)
-for p in $(printf '%s\n' "${PORTS[@]}" | sort -u); do
-  if grep -Eq "(dport|port|^)[ =:]*$p([^0-9]|$)|$p/tcp" <<<"$fw_rules"; then
-    pass "Firewall rules reference port $p (verify they restrict source networks)"
-  else
-    warn "No firewall rule found referencing port $p (heuristic check)" "Allow port $p only from trusted subnets"
-  fi
-done
-
-# =============================================================================
-section "Information leakage"
-# =============================================================================
-[[ $(last_value httpd_suppress_version_string) == on ]] \
-  && pass "Version string suppressed" \
-  || fail "Squid version shown in error pages and headers" "Set 'httpd_suppress_version_string on'"
-
-[[ $(last_value via) == off ]] \
-  && pass "Via header disabled" \
-  || fail "Via header enabled (reveals proxy name and version)" "Set 'via off'"
-
-ff=$(last_value forwarded_for)
-case ${ff:-on} in
-  delete) pass "X-Forwarded-For removed (forwarded_for delete)" ;;
-  off)    warn "forwarded_for off still sends 'X-Forwarded-For: unknown'" "Use 'forwarded_for delete'" ;;
-  *)      fail "Client IPs leaked via X-Forwarded-For (forwarded_for ${ff:-on})" "Set 'forwarded_for delete'" ;;
-esac
-
-vh=$(last_value visible_hostname)
-[[ -n $vh ]] \
-  && pass "visible_hostname set ($vh)" \
-  || warn "visible_hostname not set; real hostname appears in error pages" "Set a generic name, e.g. 'visible_hostname proxy'"
-
-[[ $(last_value strip_query_terms) == off ]] \
-  && fail "Full query strings are logged (may contain tokens/passwords)" "Set 'strip_query_terms on'" \
-  || pass "Query strings stripped from logs"
-
-# =============================================================================
-section "Resource limits"
-# =============================================================================
-rh=$(last_value request_header_max_size)
-pass "request_header_max_size: ${rh:-64 KB (default)}"
-
-[[ -n $(values reply_body_max_size) ]] \
-  && pass "reply_body_max_size set" \
-  || warn "reply_body_max_size not set (unlimited downloads)" "e.g. 'reply_body_max_size 500 MB'"
-
-[[ -n $(values request_body_max_size) ]] \
-  && pass "request_body_max_size set" \
-  || warn "request_body_max_size not set (unlimited uploads)" "e.g. 'request_body_max_size 50 MB'"
-
-mc_acls=$(awk '$1=="acl" && $3=="maxconn" {print $2}' <<<"$CONF" | paste -sd'|')
-if [[ -n $mc_acls ]] && grep -Eq "^http_access deny (.* )?($mc_acls)( |$)" <<<"$HTTP_ACCESS"; then
-  pass "Per-client connection limit enforced (maxconn ACL)"
-else
-  warn "No per-client connection limit" "Add 'acl maxconn_limit maxconn 50' and 'http_access deny maxconn_limit localnet'"
-fi
-
-cl=$(last_value client_lifetime)
-[[ -n $cl ]] && pass "client_lifetime: $cl" || warn "client_lifetime not set (default 1 day)" "e.g. 'client_lifetime 1 hour'"
-
-# =============================================================================
-section "System, users and permissions"
-# =============================================================================
-ceu=$(last_value cache_effective_user)
-if [[ $ceu == root ]]; then
-  fail "cache_effective_user is root" "Set 'cache_effective_user squid' (or 'proxy' on Debian/Ubuntu)"
-elif [[ -n $ceu ]]; then
-  pass "cache_effective_user: $ceu"
-else
-  info "cache_effective_user not set; using compile-time default"
-fi
-
-run_users=$(ps -eo user=,comm= 2>/dev/null | awk '$2 ~ /^squid/ {print $1}' | sort -u | paste -sd' ')
-if [[ -z $run_users ]]; then
-  info "No running squid processes found"
-elif [[ $run_users == root ]]; then
-  fail "All squid processes run as root"
-else
-  pass "Squid worker processes run as: $run_users"
-fi
-
-for f in "${CONF_FILES[@]}"; do
-  owner=$(stat -c '%U' "$f" 2>/dev/null); o=$(perm_other "$f"); g=$(perm_group "$f")
-  if [[ $owner != root ]]; then
-    fail "$f owned by '$owner'" "chown root: $f"
-  elif (( (o & 2) || (g & 2) )); then
-    fail "$f is group/world-writable ($(stat -c '%a' "$f"))" "chmod 640 $f"
-  elif (( o & 4 )); then
-    warn "$f is world-readable ($(stat -c '%a' "$f"))" "chmod 640 $f"
-  else
-    pass "$f ownership and mode OK ($(stat -c '%U:%G %a' "$f"))"
-  fi
-done
-
-log_dirs=$( { values access_log; values cache_log; } | awk '{print $1}' | grep -v '^none$' \
-            | sed -E 's#^[a-z]+:##' | xargs -r -n1 dirname 2>/dev/null | sort -u)
-[[ -z $log_dirs ]] && log_dirs=/var/log/squid
-for d in $log_dirs; do
-  [[ -d $d ]] || continue
-  o=$(perm_other "$d")
-  if (( o & 2 )); then
-    fail "Log directory $d is world-writable" "chmod o-rwx $d"
-  elif (( o & 4 )) || [[ -n $(find "$d" -maxdepth 1 -type f -perm -o+r 2>/dev/null | head -n1) ]]; then
-    warn "Logs in $d are world-readable (they contain browsing history)" "chmod -R o-rwx $d"
-  else
-    pass "Log directory $d not world-accessible"
-  fi
-done
-
-if [[ -n $(values logfile_rotate) || -f /etc/logrotate.d/squid ]]; then
-  pass "Log rotation configured"
-else
-  warn "No log rotation found" "Add /etc/logrotate.d/squid or set logfile_rotate"
-fi
-
-while read -r line; do
-  [[ -z $line ]] && continue
-  cdir=$(awk '{print $2}' <<<"$line")
-  [[ -d $cdir ]] || continue
-  owner=$(stat -c '%U' "$cdir"); o=$(perm_other "$cdir")
-  if [[ $owner == root ]]; then
-    warn "Cache dir $cdir owned by root" "chown -R ${ceu:-squid}: $cdir"
-  elif (( o & 2 )); then
-    fail "Cache dir $cdir is world-writable" "chmod o-rwx $cdir"
-  else
-    pass "Cache dir $cdir ownership and mode OK"
-  fi
-done <<<"$(values cache_dir)"
-
-# =============================================================================
-section "SSL bumping"
-# =============================================================================
-if [[ -z $(values ssl_bump) ]]; then
-  info "ssl_bump not configured; skipping"
-else
-  grep -Eq '^sslproxy_cert_error allow all' <<<"$CONF" \
-    && fail "Upstream certificate errors are ignored (sslproxy_cert_error allow all)" "Remove it; allow only specific known exceptions" \
-    || pass "Upstream certificate errors not blanket-ignored"
-
-  grep -Eq '^(tls_outgoing_options|sslproxy_flags) .*DONT_VERIFY_PEER' <<<"$CONF" \
-    && fail "Upstream certificate verification disabled (DONT_VERIFY_PEER)" "Remove DONT_VERIFY_PEER" \
-    || pass "Upstream certificate verification enabled"
-
-  grep -Eq '^ssl_bump splice' <<<"$CONF" \
-    && pass "Some traffic is spliced (not decrypted)" \
-    || warn "No 'ssl_bump splice' rules: all TLS traffic is decrypted" "Splice sensitive categories (banking, health) instead of bumping"
-
-  keys=$( { values http_port; values https_port; } | grep -oE '(tls-)?(key|cert)=[^ ]+' | sed -E 's/^[^=]+=//' | sort -u)
-  for k in $keys; do
-    [[ -f $k ]] || continue
-    if grep -q 'PRIVATE KEY' "$k" 2>/dev/null; then
-      o=$(perm_other "$k")
-      (( o != 0 )) \
-        && fail "CA private key $k is accessible to other users ($(stat -c '%a' "$k"))" "chmod 600 $k" \
-        || pass "CA private key $k not world-accessible"
-    fi
+# 6. Warn about included files that might still override our settings.
+for inc in $(awk '$1=="include"{ $1=""; print }' "$STAGED"); do
+  for f in $inc; do
+    [[ -f $f ]] && grep -qE "^[[:space:]]*($MANAGED)[[:space:]]" "$f" \
+      && note "$f also sets one of the managed directives; check it doesn't override the hardening block"
   done
+done
+
+# 7. Validate the staged config before installing it.
+if ! parse_out=$("$SQUID_BIN" -k parse -f "$STAGED" 2>&1); then
+  err "New config failed validation; nothing was changed:"
+  grep -E 'ERROR|FATAL' <<<"$parse_out" | head -n10 | sed 's/^/         /'
+  exit 1
 fi
+ok "New config validated (squid -k parse)"
+
+echo
+diff -u --label "$CONF (current)" --label "$CONF (hardened)" "$CONF" "$STAGED" | sed 's/^/    /'
+echo
+[[ -z $BIND_IP ]] && note "No -i given: Squid still listens on all interfaces"
 
 # =============================================================================
-section "Service sandboxing (systemd)"
+# Planned system changes
 # =============================================================================
-if command -v systemctl >/dev/null 2>&1 && systemctl cat squid.service >/dev/null 2>&1; then
-  missing=()
-  [[ $(systemctl show -p NoNewPrivileges --value squid) == yes ]] || missing+=("NoNewPrivileges=yes")
-  [[ $(systemctl show -p ProtectSystem   --value squid) =~ ^(yes|full|strict)$ ]] || missing+=("ProtectSystem=full")
-  [[ $(systemctl show -p ProtectHome     --value squid) =~ ^(yes|read-only|tmpfs)$ ]] || missing+=("ProtectHome=yes")
-  [[ $(systemctl show -p PrivateTmp      --value squid) == yes ]] || missing+=("PrivateTmp=yes")
-  if (( ${#missing[@]} == 0 )); then
-    pass "systemd sandboxing options enabled"
+PORTS=$(awk '$1=="http_port"||$1=="https_port"{ n=split($2,a,":"); print a[n] }' "$STAGED" | sort -u)
+[[ -z $PORTS ]] && PORTS=3128
+OVERRIDE_DIR=/etc/systemd/system/squid.service.d
+OVERRIDE="$OVERRIDE_DIR/hardening.conf"
+LOG_DIRS=$(awk '($1=="access_log"||$1=="cache_log") && $2!="none"{ sub(/^[a-z]+:/,"",$2); print $2 }' "$STAGED" \
+           | xargs -r -n1 dirname | sort -u)
+[[ -z $LOG_DIRS ]] && LOG_DIRS=/var/log/squid
+
+if (( DRY_RUN )); then
+  section "Planned system changes"
+  plan "Back up $CONF_DIR to $BACKUP"
+  plan "Install hardened $CONF"
+  plan "chown root:$SQUID_GROUP and chmod 640 on $CONF and $CONF_DIR/conf.d/*.conf"
+  for d in $LOG_DIRS; do plan "chmod -R o-rwx $d"; done
+  (( HAS_SYSTEMD )) && plan "Write $OVERRIDE (NoNewPrivileges, ProtectSystem, ProtectHome, PrivateTmp)"
+  if (( ${#SUBNETS[@]} )); then
+    plan "Firewall: allow port(s) $(echo $PORTS) only from ${SUBNETS[*]}"
   else
-    warn "systemd sandboxing not fully enabled; missing: ${missing[*]}" \
-         "systemctl edit squid  ->  add them under [Service], then restart"
+    skip "Firewall (use -s SUBNET to enable)"
   fi
-else
-  info "squid.service not found; skipping systemd checks"
+  (( NO_RESTART )) || plan "Restart squid (auto-rollback if it fails)"
+  printf '\n%sDry run complete.%s Re-run without -n to apply.\n' "$BLD" "$RST"
+  exit 0
 fi
 
 # =============================================================================
-printf '\n%sSummary:%s %s%d passed%s, %s%d warnings%s, %s%d failed%s\n' \
-  "$BLD" "$RST" "$GRN" "$PASS_N" "$RST" "$YEL" "$WARN_N" "$RST" "$RED" "$FAIL_N" "$RST"
-(( FAIL_N > 0 )) && exit 1
-exit 0
+section "Applying"
+# =============================================================================
+mkdir -p "$BACKUP"
+cp -a "$CONF_DIR" "$BACKUP/"
+OVERRIDE_EXISTED=0
+[[ -f $OVERRIDE ]] && { OVERRIDE_EXISTED=1; cp -a "$OVERRIDE" "$BACKUP/"; }
+ok "Backup saved to $BACKUP"
+
+cat "$STAGED" > "$CONF"          # keep the original file's inode/ownership
+ok "Hardened config installed"
+
+# --- permissions --------------------------------------------------------------
+conf_files=("$CONF")
+for f in "$CONF_DIR"/conf.d/*.conf; do [[ -f $f ]] && conf_files+=("$f"); done
+chown root:"$SQUID_GROUP" "${conf_files[@]}" && chmod 640 "${conf_files[@]}"
+ok "Config files set to root:$SQUID_GROUP 640"
+
+for d in $LOG_DIRS; do
+  [[ -d $d ]] && chmod -R o-rwx "$d" && ok "Removed world access from $d"
+done
+if [[ -f /etc/logrotate.d/squid ]] && grep -qE '^\s*create\s+[0-7]*[1-7]\b' /etc/logrotate.d/squid; then
+  note "/etc/logrotate.d/squid 'create' mode gives others access to new logs; consider 'create 640 $SQUID_USER $SQUID_GROUP'"
+fi
+
+# --- systemd sandboxing -------------------------------------------------------
+if (( HAS_SYSTEMD )); then
+  mkdir -p "$OVERRIDE_DIR"
+  cat > "$OVERRIDE" <<'EOF'
+# Added by squid_harden.sh
+[Service]
+NoNewPrivileges=yes
+ProtectSystem=full
+ProtectHome=yes
+PrivateTmp=yes
+EOF
+  systemctl daemon-reload
+  ok "systemd sandboxing override written ($OVERRIDE)"
+else
+  skip "systemd not managing squid; sandboxing skipped"
+fi
+
+# --- firewall -----------------------------------------------------------------
+if (( ${#SUBNETS[@]} == 0 )); then
+  skip "Firewall (use -s SUBNET to restrict the proxy port)"
+elif command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q 'Status: active'; then
+  for p in $PORTS; do
+    for s in "${SUBNETS[@]}"; do ufw allow from "$s" to any port "$p" proto tcp >/dev/null; done
+    ufw deny "$p"/tcp >/dev/null
+  done
+  ok "ufw: port(s) $(echo $PORTS) allowed only from ${SUBNETS[*]}"
+elif command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --state >/dev/null 2>&1; then
+  for p in $PORTS; do
+    firewall-cmd --permanent -q --remove-port="$p"/tcp 2>/dev/null
+    for s in "${SUBNETS[@]}"; do
+      firewall-cmd --permanent -q --add-rich-rule="rule family=ipv4 source address=$s port port=$p protocol=tcp accept"
+    done
+  done
+  firewall-cmd -q --reload
+  ok "firewalld: port(s) $(echo $PORTS) allowed only from ${SUBNETS[*]}"
+elif command -v iptables >/dev/null 2>&1; then
+  for p in $PORTS; do
+    iptables -C INPUT -p tcp --dport "$p" -j DROP 2>/dev/null || iptables -I INPUT 1 -p tcp --dport "$p" -j DROP
+    for s in "${SUBNETS[@]}"; do
+      iptables -C INPUT -p tcp -s "$s" --dport "$p" -j ACCEPT 2>/dev/null || iptables -I INPUT 1 -p tcp -s "$s" --dport "$p" -j ACCEPT
+    done
+    iptables -C INPUT -i lo -p tcp --dport "$p" -j ACCEPT 2>/dev/null || iptables -I INPUT 1 -i lo -p tcp --dport "$p" -j ACCEPT
+  done
+  ok "iptables: port(s) $(echo $PORTS) allowed only from ${SUBNETS[*]}"
+  note "iptables rules are not persistent; save them (e.g. apt install iptables-persistent && netfilter-persistent save)"
+else
+  note "No active ufw/firewalld and no iptables found; restrict port(s) $(echo $PORTS) manually"
+fi
+command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q inactive && (( ${#SUBNETS[@]} )) \
+  && note "ufw is installed but inactive; used iptables instead (not enabling ufw to avoid locking you out)"
+
+# --- restart with rollback ----------------------------------------------------
+rollback() {
+  err "Squid failed to start; rolling back"
+  cp -a "$BACKUP/$(basename "$CONF_DIR")/." "$CONF_DIR/"
+  if (( HAS_SYSTEMD )); then
+    if (( OVERRIDE_EXISTED )); then cp -a "$BACKUP/$(basename "$OVERRIDE")" "$OVERRIDE"; else rm -f "$OVERRIDE"; fi
+    systemctl daemon-reload; systemctl restart squid
+  fi
+  err "Previous config restored. Check: journalctl -u squid -n 50"
+  exit 1
+}
+
+if (( NO_RESTART )); then
+  skip "Restart (-R given). Run: systemctl restart squid"
+elif (( HAS_SYSTEMD )); then
+  systemctl restart squid; sleep 3
+  systemctl is-active -q squid && ok "Squid restarted and running" || rollback
+else
+  "$SQUID_BIN" -k reconfigure 2>/dev/null && ok "Squid reconfigured" \
+    || note "Couldn't signal squid; restart it manually"
+fi
+
+section "Done"
+echo "  Backup:   $BACKUP"
+echo "  Undo:     cp -a $BACKUP/$(basename "$CONF_DIR")/. $CONF_DIR/ && rm -f $OVERRIDE && systemctl daemon-reload && systemctl restart squid"
+echo "  Verify:   ./squid.sh   (the audit script)"
+echo "  Not automated: proxy authentication (site-specific) and moving to Squid 6.x+ if you're on 5.x."
