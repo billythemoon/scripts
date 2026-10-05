@@ -8,6 +8,13 @@ PASS_MIN_DAYS=7
 PASS_WARN_AGE=14     
 UID_MIN=1000         
 
+# Password reset: sets every targeted user's password to NEW_PASSWORD.
+# NOTE: this is stored in plaintext in this file -- delete the script when done.
+CHANGE_PASSWORDS=1                # 1 = reset passwords, 0 = only apply the aging policy
+NEW_PASSWORD='Qwertyuiop-01'
+CHANGE_ROOT=0                     # 1 = also set root's password + policy (off by default: root's
+                                  #     password is normally locked, and setting one enables password login)
+
 # pwquality (password complexity) settings
 PWQ_MINLEN=12          # minimum password length
 PWQ_MINCLASS=3         # min character classes required (upper/lower/digit/special)
@@ -90,35 +97,88 @@ else
     echo "complexity settings."
 fi
 
-echo "Applying policy retroactively to existing users (UID >= $UID_MIN)..."
+# ----- Pick the users to apply this to -----
+# Every account with UID >= UID_MIN, PLUS every account listed after the first
+# UID_MIN account in /etc/passwd (useradd appends, so this catches accounts added
+# later even if they were given a low, service-looking UID). "nobody"/"nogroup"
+# are excluded. Accounts with a non-login shell are skipped below.
+mapfile -t USERS < <(awk -F: -v anchor="$UID_MIN" '
+    $3 == anchor { after = 1 }
+    ($1 != "nobody" && $1 != "nogroup" && ($3 + 0 >= anchor || after)) { print $1 }
+' /etc/passwd)
 
+if [[ "$CHANGE_ROOT" -eq 1 ]]; then
+    USERS=(root "${USERS[@]}")
+fi
 
-mapfile -t USERS < <(awk -F: -v minuid="$UID_MIN" '($3 >= minuid) && ($1 != "nobody") {print $1}' /etc/passwd)
+is_login_shell() {
+    local shell
+    shell=$(getent passwd "$1" | cut -d: -f7)
+    case "$shell" in
+        *nologin|*/false|*/sync|*/shutdown|*/halt) return 1 ;;
+        *) return 0 ;;
+    esac
+}
+
+echo "Applying aging policy$([[ "$CHANGE_PASSWORDS" -eq 1 ]] && echo " and resetting passwords") for existing users..."
+
+TARGETS=()
+PW_FAILED=()
 
 if [[ ${#USERS[@]} -eq 0 ]]; then
     echo "No matching users found."
 else
     for user in "${USERS[@]}"; do
-        shell=$(getent passwd "$user" | cut -d: -f7)
-        if [[ "$shell" == *"nologin"* || "$shell" == *"/false" ]]; then
-            echo "  Skipping $user (non-login shell: $shell)"
+        if ! is_login_shell "$user"; then
+            echo "  Skipping $user (non-login shell: $(getent passwd "$user" | cut -d: -f7))"
             continue
         fi
+        TARGETS+=("$user")
 
-        echo "  Updating $user"
+        # Reset the password first. chpasswd also stamps today as the "last
+        # changed" date, which clears any "password must be changed" flag.
+        # It goes through PAM, so the pwquality rules above are enforced; a
+        # rejection is recorded and the script carries on with the next user.
+        if [[ "$CHANGE_PASSWORDS" -eq 1 ]]; then
+            if echo "${user}:${NEW_PASSWORD}" | chpasswd 2>/dev/null; then
+                pw_status="password reset"
+            else
+                pw_status="PASSWORD NOT CHANGED"
+                PW_FAILED+=("$user")
+            fi
+        else
+            pw_status="password untouched"
+        fi
+
         chage --maxdays "$PASS_MAX_DAYS" \
               --mindays "$PASS_MIN_DAYS" \
               --warndays "$PASS_WARN_AGE" \
               "$user"
+        echo "  $user: aging policy applied, $pw_status"
     done
 fi
 
 echo ""
-echo "Done. Current policy summary for affected users:"
-for user in "${USERS[@]}"; do
-    shell=$(getent passwd "$user" | cut -d: -f7)
-    [[ "$shell" == *"nologin"* || "$shell" == *"/false" ]] && continue
-    echo "--- $user ---"
-    chage -l "$user"
-    echo ""
+echo "Done. Policy summary for the ${#TARGETS[@]} affected user(s):"
+printf "  %-16s %-14s %-14s %s\n" "USER" "LAST CHANGED" "EXPIRES" "MIN/MAX/WARN"
+for user in "${TARGETS[@]}"; do
+    info=$(chage -l "$user")
+    last=$(echo "$info"  | awk -F': ' '/Last password change/ {print $2}')
+    exp=$(echo "$info"   | awk -F': ' '/^Password expires/ {print $2}')
+    min=$(echo "$info"   | awk -F': ' '/Minimum number/ {print $2}')
+    max=$(echo "$info"   | awk -F': ' '/Maximum number/ {print $2}')
+    warn=$(echo "$info"  | awk -F': ' '/Number of days of warning/ {print $2}')
+    printf "  %-16s %-14s %-14s %s/%s/%s\n" "$user" "$last" "$exp" "$min" "$max" "$warn"
 done
+
+if [[ ${#PW_FAILED[@]} -gt 0 ]]; then
+    echo ""
+    echo "WARNING: the password could not be set for: ${PW_FAILED[*]}"
+    echo "(Most likely it was rejected by the pwquality rules, or the account is locked/special.)"
+fi
+
+if [[ "$CHANGE_PASSWORDS" -eq 1 && ${#PW_FAILED[@]} -lt ${#TARGETS[@]} ]]; then
+    echo ""
+    echo "Every account not listed above now has the same password. Delete this script when"
+    echo "done (it contains that password in plaintext)."
+fi
