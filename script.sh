@@ -7,3 +7,4 @@ chmod +x users.sh
 chmod +x all.sh
 chmod +x sh.sh
 chmod +x squid.sh
+chmod +x perms.sh
