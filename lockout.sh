@@ -7,55 +7,35 @@
 #
 # Must be run as root.
 #
-# SAFETY NET: PAM changes take effect immediately, for every login method
-# at once (console, SSH, GUI, autologin) -- there's no "restart a service"
-# step to fail safely at. So this script applies the change, then starts a
-# background timer. If you don't confirm it worked within ROLLBACK_DELAY
-# seconds (by running this same script with --confirm, from a NEW login
-# session), it automatically reverts itself. This means you cannot be
-# permanently locked out, even if the PAM edit is completely broken --
-# worst case, you wait out the timer.
 #
-# Usage:
-#   sudo ./set_lockout_policy.sh            Apply the policy, start the safety-net timer
-#   sudo ./set_lockout_policy.sh --confirm  Cancel the pending auto-revert (run this
-#                                            from a NEW session after confirming login works)
+# Usage:  sudo ./set_lockout_policy.sh
+#
+# Applies immediately and stays applied. Every file it edits is backed up first
+# (*.bak.<timestamp>). Test a login in a NEW terminal before closing this one.
 
-set -uo pipefail   # no -e: we want to control rollback ourselves on failure, not abort mid-way
+set -uo pipefail
 
 # ----- Configurable policy values -----
 LOCKOUT_DENY=5             # Failed attempts before lockout
 LOCKOUT_UNLOCK_TIME=900    # Seconds before auto-unlock (900 = 15 min). 0 = locked until an admin runs faillock --user X --reset
 LOCKOUT_FAIL_INTERVAL=900  # Window (seconds) in which failed attempts accumulate toward the deny threshold
-ROLLBACK_DELAY_MIN=3       # Minutes to wait for --confirm before auto-reverting
 # ---------------------------------------
-
-STATE_FILE="/root/.set_lockout_policy_state"
-CONFIRM_FILE="/root/.set_lockout_policy_confirmed"
 
 if [[ $EUID -ne 0 ]]; then
     echo "This script must be run as root (use sudo)." >&2
     exit 1
 fi
 
-# ----- Handle --confirm: cancel the pending auto-revert -----
-if [[ "${1:-}" == "--confirm" ]]; then
-    if [[ -f "$STATE_FILE" ]]; then
-        touch "$CONFIRM_FILE"
-        # Also remove our specific queued at job outright (belt and
-        # suspenders; the job already checks for CONFIRM_FILE too, so this
-        # isn't strictly required for safety -- just tidiness). Only our
-        # own recorded job ID is touched, never other at jobs on the system.
-        OUR_JOB_ID=$(grep '^AT_JOB_ID=' "$STATE_FILE" | cut -d= -f2)
-        [[ -n "$OUR_JOB_ID" ]] && atrm "$OUR_JOB_ID" 2>/dev/null
-        echo "Confirmed. The pending auto-revert has been cancelled."
-        echo "Your lockout policy changes are now permanent."
-        exit 0
-    else
-        echo "No pending change found to confirm (nothing to do)."
-        exit 0
-    fi
+# ----- Cancel any auto-revert left over from an older version of this script -----
+# (older versions scheduled an 'at' job that undid the lockout after 3 minutes)
+if command -v atq >/dev/null 2>&1; then
+    for job in $(atq 2>/dev/null | awk '{print $1}'); do
+        if at -c "$job" 2>/dev/null | grep -q 'set_lockout_policy'; then
+            atrm "$job" && echo "Cancelled a pending auto-revert left by an older run (at job $job)."
+        fi
+    done
 fi
+rm -f /root/.set_lockout_policy_state /root/.set_lockout_policy_confirmed
 
 TIMESTAMP=$(date +%Y%m%d%H%M%S)
 
@@ -66,30 +46,6 @@ backup_file() {
         echo "  Backed up $f -> ${f}.bak.${TIMESTAMP}"
     fi
 }
-
-# ----- The safety net depends on 'at', a scheduler that runs via its own
-# system daemon (atd), independent of this shell session. This matters:
-# a plain backgrounded process (nohup/disown) can still be killed the
-# moment this login session ends on modern systemd systems (logind can
-# tear down a whole user session's processes), which would silently
-# disarm the safety net. 'at' avoids that entirely. -----
-if ! command -v at >/dev/null 2>&1; then
-    echo "Installing 'at' (needed for the auto-revert safety net)..."
-    if command -v apt-get >/dev/null 2>&1; then
-        apt-get install -y at >/dev/null 2>&1
-    fi
-fi
-if ! command -v at >/dev/null 2>&1; then
-    echo "ERROR: 'at' could not be found or installed. Refusing to proceed" >&2
-    echo "without the safety net -- install it manually (apt install at) and re-run." >&2
-    exit 1
-fi
-systemctl enable --now atd >/dev/null 2>&1 || service atd start >/dev/null 2>&1 || true
-if ! pgrep -x atd >/dev/null 2>&1; then
-    echo "ERROR: atd doesn't appear to be running, and the safety net needs it." >&2
-    echo "Start it manually (systemctl start atd) and re-run." >&2
-    exit 1
-fi
 
 # ----- Verify every PAM module we're about to reference actually exists -----
 # Referencing a module that isn't installed is one of the fastest ways to
@@ -258,65 +214,13 @@ PROFILE2
         ;;
 esac
 
-# ----- Arm the safety net (only meaningful if we actually touched PAM files) -----
-rm -f "$CONFIRM_FILE"   # any previous confirmation no longer applies to this run
-
-if [[ "$FAMILY" == "debian" && -n "${AUTH_FILE:-}" ]]; then
-    AUTH_BACKUP="${AUTH_FILE}.bak.${TIMESTAMP}"
-    ACCOUNT_BACKUP="${ACCOUNT_FILE}.bak.${TIMESTAMP}"
-
-    {
-        echo "AUTH_FILE=$AUTH_FILE"
-        echo "AUTH_BACKUP=$AUTH_BACKUP"
-        echo "ACCOUNT_FILE=$ACCOUNT_FILE"
-        echo "ACCOUNT_BACKUP=$ACCOUNT_BACKUP"
-    } > "$STATE_FILE"
-
-    # Scheduled via 'at', which runs through atd (an independent system
-    # service) -- NOT a child of this shell. This survives the terminal
-    # closing, the SSH session dropping, or even this whole login session
-    # ending, which a plain backgrounded/nohup'd process is not guaranteed
-    # to survive on systemd systems (logind can tear down a user's entire
-    # process set when their last session ends).
-    # NOTE: 'at' always executes jobs via /bin/sh (dash on Debian/Ubuntu),
-    # regardless of any shebang line -- confirmed by testing. dash doesn't
-    # support bash's [[ ]] test syntax (it fails as "command not found" and
-    # silently takes the wrong branch), so this must be plain POSIX sh.
-    AT_SCRIPT=$(mktemp)
-    cat > "$AT_SCRIPT" << EOF
-if [ ! -f '$CONFIRM_FILE' ]; then
-    [ -f '$AUTH_BACKUP' ] && cp '$AUTH_BACKUP' '$AUTH_FILE'
-    [ -f '$ACCOUNT_BACKUP' ] && cp '$ACCOUNT_BACKUP' '$ACCOUNT_FILE'
-    pam-auth-update --force >/dev/null 2>&1
-    logger -t set_lockout_policy 'Auto-reverted PAM changes after ${ROLLBACK_DELAY_MIN} min with no --confirm received'
-fi
-rm -f '$AT_SCRIPT'
-EOF
-    AT_OUTPUT=$(at now + "${ROLLBACK_DELAY_MIN}" minutes -f "$AT_SCRIPT" 2>&1)
-    AT_JOB_ID=$(echo "$AT_OUTPUT" | grep -oE '^job [0-9]+' | awk '{print $2}')
-    echo "AT_JOB_ID=$AT_JOB_ID" >> "$STATE_FILE"
-
-    echo ""
-    echo "=================================================================="
-    echo " SAFETY NET ARMED (via 'at', job #$AT_JOB_ID)"
-    echo "=================================================================="
-    echo "The change above is LIVE right now. You have $ROLLBACK_DELAY_MIN minute(s) to:"
-    echo ""
-    echo "  1. Open a NEW terminal/session (don't close this one yet)"
-    echo "  2. Confirm you can log in normally"
-    echo "  3. Run:  sudo $0 --confirm"
-    echo ""
-    echo "If you don't run --confirm in time, the scheduled 'at' job will"
-    echo "AUTOMATICALLY restore the original PAM files on its own -- this"
-    echo "happens via atd, independent of this session, so it fires even if"
-    echo "you close this terminal, disconnect, or your session ends entirely."
-    echo ""
-    echo "Check it's still scheduled any time with: atq"
-fi
-
 echo ""
 echo "Current faillock configuration:"
 grep -E "^(deny|unlock_time|fail_interval)" "$FAILLOCK_CONF" || true
 echo ""
 echo "To check a user's lockout status:  faillock --user <username>"
 echo "To manually unlock a user:         faillock --user <username> --reset"
+echo ""
+echo "The lockout policy is applied and permanent. Open a NEW terminal and log in to"
+echo "make sure logins still work before closing this one. To undo, copy the .bak"
+echo "files listed above back into place and run: sudo pam-auth-update --force"
