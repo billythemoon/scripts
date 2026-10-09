@@ -188,16 +188,37 @@ Auth:
 	sufficient			pam_faillock.so authsucc
 PROFILE2
 
-            if pam-auth-update --enable faillock-preauth faillock-tally --force >/dev/null 2>&1; then
+            if pam-auth-update --enable faillock-preauth faillock-tally --force >/dev/null 2>&1 \
+               && grep -qE '^auth.*pam_unix\.so' "$AUTH_FILE" && grep -qE '^account.*pam_unix\.so' "$ACCOUNT_FILE"; then
                 echo "  pam-auth-update applied successfully."
             else
-                echo "  pam-auth-update FAILED. Restoring original PAM files from backup." >&2
+                echo "  pam-auth-update FAILED or dropped pam_unix (that would let any password log in)." >&2
+                echo "  Restoring original PAM files from backup." >&2
                 cp "${AUTH_FILE}.bak.${TIMESTAMP}" "$AUTH_FILE" 2>/dev/null
                 cp "${ACCOUNT_FILE}.bak.${TIMESTAMP}" "$ACCOUNT_FILE" 2>/dev/null
                 rm -f /usr/share/pam-configs/faillock-preauth /usr/share/pam-configs/faillock-tally
                 echo "  Nothing was left changed." >&2
                 exit 1
             fi
+        fi
+
+        # ----- Null passwords must not authenticate: remove 'nullok' -----
+        # Removed from the generated files only. Ubuntu's template in
+        # /usr/share/pam-configs/unix is deliberately NOT edited: testing showed
+        # a modified template can make pam-auth-update drop pam_unix entirely,
+        # which lets ANY password log in. Downside: if pam-auth-update runs
+        # again later (e.g. a package update), nullok comes back -- just re-run
+        # this script.
+        for f in /etc/pam.d/common-auth /etc/pam.d/common-password; do
+            if grep -qE 'pam_unix\.so.*nullok' "$f" 2>/dev/null; then
+                backup_file "$f"
+                sed -i -E '/pam_unix\.so/ s/[[:space:]]+nullok(_secure)?//g' "$f"
+            fi
+        done
+        if grep -q nullok /etc/pam.d/common-auth 2>/dev/null; then
+            echo "  WARNING: 'nullok' is still in /etc/pam.d/common-auth"
+        else
+            echo "  'nullok' removed: accounts with empty passwords can't log in"
         fi
         ;;
     rhel-manual)
