@@ -3,6 +3,7 @@
 ./password.sh
 ./ssh.sh
 ./squid.sh
+./perms.sh
 echo
 echo
 echo
