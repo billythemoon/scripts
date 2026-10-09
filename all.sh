@@ -1,7 +1,8 @@
 ./random.sh
-./password.sh
 ./lockout.sh
+./password.sh
 ./ssh.sh
+./squid.sh
 echo
 echo
 echo
